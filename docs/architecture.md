@@ -23,6 +23,7 @@ The implementation deliberately uses native Linux facilities rather than introdu
                 |               |               |
                POSIX ACLs + ownership + mode bits
 
+
        company-files-bootstrap       company-files-admin
                  |                            |
         Provisioning and policy       Status / disk / audit /
