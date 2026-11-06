@@ -26,6 +26,7 @@ see [Architecture](docs/architecture.md) for the component and data-flow details
 
 ```text
 .
+├── LICENSE
 ├── README.md
 ├── config/
 │   └── policy.conf
