@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+
+# Administrative interface for the company file server.
+# Provides service inspection, security auditing, permission-policy
+# verification, chroot repair and verified backups with retention.
+#
+# Configuration: /etc/company-files/policy.conf
+# Usage: company-files-admin {status|disk|audit|repair|policy|backup}
+
+config="/etc/company-files/policy.conf"
+
+# Abort if the policy doesn't exist or is unreadable
+if [[ ! -r "$config" ]]; then
+	echo "ERROR: Missing configuration: $config"
+	exit 1
+fi
+
+source "$config"
+
+set -u
+
+check() {
+	if "$@"; then
+		echo "PASS"
+		return 0
+	else
+		echo "FAIL"
+		return 1
+	fi
+}
+
+# Display the service's current state and storage capacity information.
+status() {
+	echo "=== Service ==="
+	systemctl is-active "$service"
+
+	echo
+	echo "=== Storage ==="
+	df -h "$storage"
+	echo
+}
+
+# Choose the disk report based on the caller's effective privileges.
+disk() {
+	if [[ $EUID -ne 0 ]]; then
+		disk_basic
+	else
+		disk_escalated
+	fi
+}
+
+disk_basic() {
+	df -h "$storage"
+}
+
+# Extend the basic disk report with per-directory usage tools.
+disk_escalated() {
+	disk_basic
+	echo
+	du -xhd1 "$storage" | sort -h
+}
+
+# Verify the file server's operational state and key security invariants.
+# service abailability, chroot permissions, SSH restrictions, access-control groups.
+audit() {
+	if [[ $EUID -ne 0 ]]; then
+		echo "Error: Run audit with sudo."
+		echo "Usage: sudo $0 audit"
+		return 1
+	fi
+
+	failed=0
+
+	echo "=== Company File Server Audit ==="
+
+	echo "[Service]"
+	if systemctl is-active --quiet "$service"; then
+		echo "SSh service: OK"
+	else
+		((failed++))
+		echo "SSh service: FAIL"
+	fi
+	if systemctl is-enabled --quiet "$service"; then
+		echo "SSH boot: OK"
+	else
+		((failed++))
+		echo "SSh boot: FAIL"
+
+	fi
+
+	echo
+	echo "[Storage]"
+	if [ -d "$storage" ]; then
+		echo "Storage path: OK"
+	else
+		((failed++))
+		echo "Storage path: FAIL"
+	fi
+
+	echo
+	owner=$(stat -c '%U:%G' "$storage")
+	mode=$(stat -c '%a' "$storage")
+
+	echo "[Security]"
+
+	echo "Owner: $owner"
+	echo "Mode: $mode"
+
+	echo -n "Chroot owner: "
+	if check test "$owner" = "root:root"; then
+		:
+	else
+		((failed++))
+	fi
+
+	echo -n "Chroot mode: "
+	if check test "$mode" = 755; then
+		:
+	else
+		((failed++))
+	fi
+
+	echo -n "Bob SFTP-only: "
+	if sudo sshd -T -C user=bob,host=localhost,addr=127.0.0.1 |
+		grep -q '^forcecommand internal-sftp$'
+	then
+		:
+	else
+		((failed++))
+	fi
+
+	echo -n "Bob password auth disabled: "
+	if sudo sshd -T -C user=bob,host=localhost,addr=127.0.0.1 |
+		grep -q '^passwordauthentication no$'
+	then
+		:
+	else
+		((failed++))
+	fi
+
+	echo
+	echo "[Users]"
+	getent group "$group_admins"
+	getent group "$group_developers"
+	getent group "$group_interns"
+
+	if [ "$failed" -eq 0 ]; then
+		echo
+		echo "Audit: HEALTHY"
+		return 0
+	else
+		echo
+		echo "Audit: FAILED ($failed checks)"
+		return 1
+	fi
+}
+
+# Restore chroot and ownership control provided storage directory exists.
+repair() {
+	if [[ $EUID -ne 0 ]]; then
+		echo "Error: Run audit with sudo."
+		echo "Usage: sudo $0 audit"
+		return 1
+	done
+
+	local failed=0
+
+	echo "=== Company File Server Repair ==="
+
+	if [ ! -d "$storage" ]; then
+		echo "FAIL: Storage path missing: $storage"
+		return 1
+	fi
+
+	echo "Restoring chroot ownership and mode..."
+	if chown root:root "$storage" && chmod 755 "$storage"; then
+		echo "PASS: chroot ownership and mode restored"
+	else
+		echo "FAIL: Could not repair chroot"
+		((failed++))
+	fi
+
+	if [ "$failed" -eq 0 ]; then
+		echo "Repair completed"
+	else
+		echo "Repair incomplete"
+		return 1
+	fi
+}
+
+acl_has() {
+	local path=$1
+	local entry=$2
+
+#	getfacl -cp "$path" | sed 's/[[:space:]]*#.*//' | grep -Fxq "$entry"
+	getfacl -cp "$path" | grep -Fxq "$entry"
+}
+
+# Verify expected group ownership and ACL entries for each managed directory.
+policy() {
+	local failed=0
+	local base="$storage"
+
+	check_acl() {
+		local path=$1
+		local entry=$2
+
+		if acl_has "$path" "$entry"; then
+			echo "PASS: $path contains $entry"
+		else
+			echo "FAIL: $path missing $entry"
+			failed=1
+		fi
+	}
+
+	check_group_owner() {
+		local path=$1
+		local expected_group=$2
+		local actual_group
+
+		actual_group=$(stat -c '%G' "$path") || return 1
+
+		if [[ "$actual_group" == "$expected_group" ]]; then
+			echo "PASS: $path group owner is $expected_group group"
+		else
+			echo "FAIL: $path group owner is $actual_group (expected $expected_group)"
+			failed=1
+		fi
+	}
+
+	check_group_owner "$base/public" "$group_admins"
+	check_acl "$base/public"	"group::rwx"
+	check_acl "$base/public"	"group:$group_developers:rwx"
+	check_acl "$base/public"	"group:$group_interns:r-x"
+	check_acl "$base/public"	"other::---"
+	echo
+
+	check_group_owner "$base/projects" "$group_developers"
+	check_acl "$base/projects"	"group:$group_admins:rwx"
+	check_acl "$base/projects"	"group::rwx"
+	check_acl "$base/projects"	"group:$group_interns:r-x"
+	check_acl "$base/projects"	"other::---"
+	echo
+
+	check_group_owner "$base/private" "$group_admins"
+	check_acl "$base/private"	"group::rwx"
+	check_acl "$base/private"	"other::---"
+
+	echo
+	if (( failed == 0 )); then
+		echo "Policy inspection completed"
+	else
+		echo "Policy inspection FAILED"
+		return 1
+	fi
+}
+
+backup() {
+	local timestamp archive size checksum
+
+	if [[ $EUID -ne 0 ]]; then
+		echo "ERROR: Run backup with sudo."
+		echo "Usage: sudo $0 backup"
+		return 1
+	fi
+
+	if [[ ! -d "$storage" ]]; then
+		echo "ERROR: Storage directory missing: $storage"
+		return 1
+	fi
+
+	timestamp=$(date +%Y%m%d-%H%M%S)
+	archive="$backup_destination/company-files-$timestamp.tar.gz"
+
+	if [[ -e "$archive" ]]; then
+		echo "ERROR: Archive already exists: $archive"
+		return 1
+	fi
+
+	echo "Creating $archive"
+
+	if tar --acls --xattrs --numeric-owner \
+		-czf "$archive" -C "$(dirname "$storage")" "$(basename "$storage")"; then
+		:
+	else
+		echo "ERROR: Archive creation failed."
+		rm -f -- "$archive"
+		return 1
+	fi
+
+	echo "archive verification"
+	if tar -tzf "$archive" >/dev/null; then
+		echo "Backup archive verified: $archive"
+	else
+		echo "ERROR:Archive verification failed."
+		rm -f -- "$archive"
+		return 1
+	fi
+
+	size=$(du -h "$archive" | cut -f1)
+	checksum=$(sha256sum "$archive" | awk '{print $1}')
+
+	echo "Backup archive:	$archive"
+	echo "Backup size:	$size"
+	echo "SHA256:		$checksum"
+
+	echo "Applying backup retention policy..."
+
+	mapfile -t backups < <(
+		find "$backup_destination" \
+			-maxdepth 1 \
+			-type f \
+			-name 'company-files-*.tar.gz' \
+			-printf '%T@ %p\n' |
+		sort -nr |
+		tail -n +$((backup_retention + 1)) |
+		cut -d' ' -f2-
+	)
+
+	for old_backup in "${backups[@]}"; do
+		echo "Removing old backup: $old_backup"
+		rm -f -- "$old_backup"
+	done
+
+	echo "Backup complete."
+	return 0
+}
+
+case "${1:-}" in
+	status)
+		status
+		;;
+	disk)
+		disk
+		;;
+	audit)
+		audit
+		;;
+	repair)
+		repair
+		;;
+	policy)
+		policy
+		;;
+	backup)
+		backup
+		;;
+	*)
+		echo "Usage: $0 {status|disk|audit|repair|policy|backup}"
+		exit 1
+		;;
+esac

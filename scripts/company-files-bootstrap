@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+
+# Bootstrap the company file server by installing dependencies,
+# provisioning users and groups, configuring storage permissions,
+# and enabling the SSH service.
+#
+# Configuration: /etc/company-files/policy.conf
+# Usage: sudo company-files-setup
+
+set -euo pipefail
+
+# Require root privileges to modify system users, groups, and filesystem settings.
+if [[ $EUID -ne 0 ]]; then
+	echo "ERROR: Run with sudo."
+	exit 1
+fi
+
+config="/etc/company-files/policy.conf"
+
+# Abort if the policy configuration is missing or unreadable
+if [[ ! -r "$config" ]]; then
+	echo "ERROR: Missing configuration: $config"
+	exit 1
+fi
+
+source "$config"
+
+# --- package installation and dependency setup ---
+
+echo "== Installing required packages =="
+apt-get update
+apt-get install -y openssh-server acl
+
+# Ensure all policy-defined groups exist before assigning users to them
+echo "== Creating groups =="
+groupadd -f "$group_admins"
+groupadd -f "$group_developers"
+groupadd -f "$group_interns"
+
+echo "== Creating users =="
+for user in $users_admins $users_developers $users_interns; do
+	id "$user" >/dev/null 2>&1 || useradd -m -s /bin/bash "$user"
+done
+
+echo "== Assigning group membership =="
+for user in $users_admins; do
+	usermod -aG "$group_admins" "$user"
+done
+
+for user in $users_developers; do
+        usermod -aG "$group_developers" "$user"
+done
+
+for user in $users_interns; do
+        usermod -aG "$group_interns" "$user"
+done
+
+echo "== Creating storage =="
+install -d -o root -g root -m 755 "$storage"
+install -d "$storage/public"
+install -d "$storage/projects"
+install -d "$storage/private"
+
+for dir in $storage_dirs; do
+	install -d "$storage/$dir"
+done
+
+# --- directory ownership and access policies ---
+
+echo "== Applying directory ownership =="
+chown root:"$group_admins" "$storage/public"
+chown root:"$group_developers" "$storage/projects"
+chown root:"$group_admins" "$storage/private"
+
+echo "== Applying ACL policy =="
+for dir in "$storage_dirs"; do
+	setfacl -b "$storage/$dir"
+done
+
+setfacl -m g::rwx "$storage/public"
+setfacl -m g:"$group_developers":rwx "$storage/public"
+setfacl -m g:"$group_interns":r-x "$storage/public"
+setfacl -m o::--- "$storage/public"
+
+setfacl -m g:"$group_admins":rwx "$storage/projects"
+setfacl -m g::rwx "$storage/projects"
+setfacl -m g:"$group_interns":r-x "$storage/projects"
+setfacl -m o::--- "$storage/projects"
+
+setfacl -m g::rwx "$storage/private"
+setfacl -m o::--- "$storage/private"
+
+echo "== Creating backup location =="
+install -d "$backup_destination"
+
+echo "== Enabling SSH =="
+systemctl enable "$service"
+systemctl restart "$service"
+
+echo "Bootstrap complete."
